@@ -1,13 +1,17 @@
-from multiprocessing import Manager, Process
+from multiprocessing import Value, Process, Manager
+import logging
+import numpy as np
 from imutils.video import VideoStream
-from FaceTrack.objcenter import ObjCenter
-from FaceTrack.pid import PID
+from rpi_deep_pantilt.control.pid import PID
 import RPi.GPIO as GPIO
 import argparse
 import signal
 import time
 import sys
 import cv2
+
+from rpi_deep_pantilt.detect.ssd_mobilenet_v3_coco import SSDMobileNet_V3_Small_Coco_PostProcessed, SSDMobileNet_V3_Coco_EdgeTPU_Quant
+from rpi_deep_pantilt.control.pid import PIDController
 
 GPIO.setmode(GPIO.BCM)
 #change pwm pins to 13 hardware pwm and other but 12=pwm0, 13=pwm1, same channel
