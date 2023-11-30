@@ -11,3 +11,4 @@ Click==7.0
 pytest==4.6.5
 gpiozero==1.6.2
 pytest-runner==5.1
+imutils==0.5.4
