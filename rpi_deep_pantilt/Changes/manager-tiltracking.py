@@ -1,194 +1,184 @@
-import logging
-from multiprocessing import Value, Process, Manager
-import time
-
-import pantilthat as pth
+from multiprocessing import Manager, Process
+from imutils.video import VideoStream
+from FaceTrack.objcenter import ObjCenter
+from FaceTrack.pid import PID
+import RPi.GPIO as GPIO
+import argparse
 import signal
+import time
 import sys
-import numpy as np
+import cv2
 
-from rpi_deep_pantilt.detect.camera import PiCameraStream
-from rpi_deep_pantilt.detect.ssd_mobilenet_v3_coco import SSDMobileNet_V3_Small_Coco_PostProcessed, SSDMobileNet_V3_Coco_EdgeTPU_Quant
-from rpi_deep_pantilt.control.pid import PIDController
+GPIO.setmode(GPIO.BCM)
+#change pwm pins to 13 hardware pwm and other but 12=pwm0, 13=pwm1, same channel
+#18 =pcm_clk, 19=pcm_fs
+tilt_pin=13
+#tilt_pin = 3
+pan_pin = 5
+#add config file to set pins from
 
-logging.basicConfig()
-LOGLEVEL = logging.getLogger().getEffectiveLevel()
-
-RESOLUTION = (320, 320)
-
-SERVO_MIN = -90
-SERVO_MAX = 90
-
-CENTER = (
-    RESOLUTION[0] // 2,
-    RESOLUTION[1] // 2
-)
-
-# function to handle keyboard interrupt
+GPIO.setup(tilt_pin, GPIO.OUT)
+GPIO.setup(pan_pin, GPIO.OUT)
+# Create AngularServo instances for pan and tilt
+pan_servo = GPIO.PWM(pan_pin, 50) # Replace 17 with the actual GPIO pin for pan
+tilt_servo = GPIO.PWM(tilt_pin, 50)  # Replace 18 with the actual GPIO pin for tilt
+#tilt_servo.start(8) #check effects
+#pan_servo.start(8)
 
 
+# Define the range for the motors
+servoRange = (-90, 90)
+
+# Function to handle keyboard interrupt
 def signal_handler(sig, frame):
-    # print a status message
+    # Print a status message
     print("[INFO] You pressed `ctrl + c`! Exiting...")
-
-    # disable the servos
-    pth.servo_enable(1, False)
-    pth.servo_enable(2, False)
-
-    # exit
+    # Exit
     sys.exit()
 
+# Function to set servo angles
+def set_servo(servo, angle):
+    #assert angle > 30 and angle <= 150
+    #tilt_servo = GPIO.PWM(tilt_pin, 50)
+    #tilt_servo.start(8)
+    dutyCycle = angle / 18. + 3.
+    servo.ChangeDutyCycle(dutyCycle)
+    time.sleep(0.3)
+    servo.stop()
 
-def run_detect(center_x, center_y, labels, edge_tpu):
-    if edge_tpu:
-        model = SSDMobileNet_V3_Coco_EdgeTPU_Quant()
-    else:
-        model = SSDMobileNet_V3_Small_Coco_PostProcessed()
+def obj_center(args, objX, objY, centerX, centerY):
+    # Signal trap to handle keyboard interrupt
+    signal.signal(signal.SIGINT, signal_handler)
+    # Start the video stream and wait for the camera to warm up
+    vs = VideoStream(usePiCamera=False).start()
+    time.sleep(2.0)
+    # Initialize the object center finder. Our cascade path is passed to the constructor.
+    obj = ObjCenter(args["cascade"])
+    
+    # Loop indefinitely
+    rect = None
+    while True:
+        # Grab the frame from the threaded video stream and flip it
+        frame = vs.read()
+        #frame = cv2.flip(frame, 0)
+        frame = cv2.flip(frame, 1)
+        # Calculate the center of the frame as this is where we will
+        # try to keep the object
+        (H, W) = frame.shape[:2]
+        centerX.value = W // 2
+        centerY.value = H // 2
+        # Find the object's location
+        objectLoc = obj.update(frame, (centerX.value, centerY.value))
+        if objectLoc is not None:
+            ((objX.value, objY.value), rect) = objectLoc
+        # Extract the bounding box and draw it
+        #rect = None
+        if rect is not None:
+            (x, y, w, h) = rect
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        # Display the frame to the screen
+        cv2.imshow("Pan-Tilt Face Tracking", frame)
+        key = cv2.waitKey(1)
+        if key == ord('q'):
+            break
 
-    capture_manager = PiCameraStream(resolution=RESOLUTION)
-    capture_manager.start()
-    capture_manager.start_overlay()
-
-    label_idxs = model.label_to_category_index(labels)
-    start_time = time.time()
-    fps_counter = 0
-    while not capture_manager.stopped:
-        if capture_manager.frame is not None:
-            frame = capture_manager.read()
-            prediction = model.predict(frame)
-
-            if not len(prediction.get('detection_boxes')):
-                continue
-
-            if any(item in label_idxs for item in prediction.get('detection_classes')):
-
-                tracked = (
-                    (i, x) for i, x in
-                    enumerate(prediction.get('detection_classes'))
-                    if x in label_idxs
-                )
-                tracked_idxs, tracked_classes = zip(*tracked)
-
-                track_target = prediction.get('detection_boxes')[
-                    tracked_idxs[0]]
-                # [ymin, xmin, ymax, xmax]
-                y = int(
-                    RESOLUTION[1] - ((np.take(track_target, [0, 2])).mean() * RESOLUTION[1]))
-                center_y.value = y
-                x = int(
-                    RESOLUTION[0] - ((np.take(track_target, [1, 3])).mean() * RESOLUTION[0]))
-                center_x.value = x
-
-                display_name = model.category_index[tracked_classes[0]]['name']
-                logging.info(
-                    f'Tracking {display_name} center_x {x} center_y {y}')
-
-            overlay = model.create_overlay(frame, prediction)
-            capture_manager.overlay_buff = overlay
-            if LOGLEVEL is logging.DEBUG and (time.time() - start_time) > 1:
-                fps_counter += 1
-                fps = fps_counter / (time.time() - start_time)
-                logging.debug(f'FPS: {fps}')
-                fps_counter = 0
-                start_time = time.time()
-
+def pid_process(output, p, i, d, objCoord, centerCoord):
+    # Signal trap to handle keyboard interrupt
+    signal.signal(signal.SIGINT, signal_handler)
+    # Create a PID and initialize it
+    p = PID(p.value, i.value, d.value)
+    p.initialise()
+    # Loop indefinitely
+    while True:
+        # Calculate the error
+        error = centerCoord.value - objCoord.value
+        # Update the value
+        output.value = p.update(error)
 
 def in_range(val, start, end):
-    # determine the input vale is in the supplied range
-    return (val >= start and val <= end)
+    # Determine if the input value is in the supplied range
+    return start <= val <= end
 
-
-def set_servos(pan, tilt):
-    # signal trap to handle keyboard interrupt
+def set_servos(tlt, pan):
+    # Signal trap to handle keyboard interrupt
     signal.signal(signal.SIGINT, signal_handler)
-
+    
+    # Loop indefinitely
     while True:
-        pan_angle = -1 * pan.value
-        tilt_angle = tilt.value
+        # The pan and tilt angles are reversed
+        #panAngle = -1 * pan.value
+        panAngle = pan.value
+        #tiltAngle = -1 * tlt.value
+        tiltAngle = tlt.value #removed -1 because vertical flipping is off
+        # If the pan angle is within the range, pan
+        if in_range(panAngle, servoRange[0], servoRange[1]):
+            set_servo(pan_servo, panAngle)
+        # If the tilt angle is within the range, tilt
+        if in_range(tiltAngle, servoRange[0], servoRange[1]):
+            set_servo(tilt_servo, tiltAngle)
 
-        # if the pan angle is within the range, pan
-        if in_range(pan_angle, SERVO_MIN, SERVO_MAX):
-            pth.pan(pan_angle)
-        else:
-            logging.info(f'pan_angle not in range {pan_angle}')
+# Check to see if this is the main body of execution
+if __name__ == "__main__":
+    # Construct the argument parser and parse the arguments
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-c", "--cascade", type=str, required=True, help="path to input Haar cascade for face detection")
+    args = vars(ap.parse_args())
 
-        if in_range(tilt_angle, SERVO_MIN, SERVO_MAX):
-            pth.tilt(tilt_angle)
-        else:
-            logging.info(f'tilt_angle not in range {tilt_angle}')
-
-
-def pid_process(output, p, i, d, box_coord, origin_coord, action):
-    # signal trap to handle keyboard interrupt
-    signal.signal(signal.SIGINT, signal_handler)
-
-    # create a PID and initialize it
-    p = PIDController(p.value, i.value, d.value)
-    p.reset()
-
-    # loop indefinitely
-    while True:
-        error = origin_coord - box_coord.value
-        output.value = p.update(error)
-        # logging.info(f'{action} error {error} angle: {output.value}')
-
-# ('person',)
-#('orange', 'apple', 'sports ball')
-
-
-def pantilt_process_manager(
-    edge_tpu=False,
-    labels=('person',)
-):
-
-    pth.servo_enable(1, True)
-    pth.servo_enable(2, True)
+    # Start a manager for managing process-safe variables
     with Manager() as manager:
-        # set initial bounding box (x, y)-coordinates to center of frame
-        center_x = manager.Value('i', 0)
-        center_y = manager.Value('i', 0)
+        tilt_servo.start(8) #check effects
+        pan_servo.start(8)
+        # Set integer values for the object center (x, y)-coordinates
+        centerX = manager.Value("i", 0)
+        centerY = manager.Value("i", 0)
+        # Set integer values for the object's (x, y)-coordinates
+        objX = manager.Value("i", 0)
+        objY = manager.Value("i", 0)
+        # Pan and tilt values will be managed by independent PIDs
+        pan = manager.Value("i", 0)
+        tlt = manager.Value("i", 0)
 
-        center_x.value = RESOLUTION[0] // 2
-        center_y.value = RESOLUTION[1] // 2
+        # Set PID values for panning
+        panP = manager.Value("f", 0.09)
+        panI = manager.Value("f", 0.08)
+        panD = manager.Value("f", 0.002)
+        # Set PID values for tilting
+        tiltP = manager.Value("f", 0.11)
+        tiltI = manager.Value("f", 0.10)
+        tiltD = manager.Value("f", 0.002)
 
-        # pan and tilt angles updated by independent PID processes
-        pan = manager.Value('i', 0)
-        tilt = manager.Value('i', 0)
+        # We have 4 independent processes
+        # 1. objectCenter  - finds/localizes the object
+        # 2. panning       - PID control loop determines panning angle
+        # 3. tilting       - PID control loop determines tilting angle
+        # 4. setServos     - drives the servos to proper angles based
+        #                    on PID feedback to keep the object in the center
 
-        # PID gains for panning
+        processObjectCenter = Process(target=obj_center, args=(args, objX, objY, centerX, centerY))
+        processPanning = Process(target=pid_process, args=(pan, panP, panI, panD, objX, centerX))
+        processTilting = Process(target=pid_process, args=(tlt, tiltP, tiltI, tiltD, objY, centerY))
+        processSetServos = Process(target=set_servos, args=(tlt, pan))
 
-        pan_p = manager.Value('f', 0.05)
-        # 0 time integral gain until inferencing is faster than ~50ms
-        pan_i = manager.Value('f', 0.1)
-        pan_d = manager.Value('f', 0)
+        # Start all 4 processes
+        processObjectCenter.start()
+        processPanning.start()
+        processTilting.start()
+        processSetServos.start()
 
-        # PID gains for tilting
-        tilt_p = manager.Value('f', 0.15)
-        # 0 time integral gain until inferencing is faster than ~50ms
-        tilt_i = manager.Value('f', 0.2)
-        tilt_d = manager.Value('f', 0)
-
-        detect_processr = Process(target=run_detect,
-                                  args=(center_x, center_y, labels, edge_tpu))
-
-        pan_process = Process(target=pid_process,
-                              args=(pan, pan_p, pan_i, pan_d, center_x, CENTER[0], 'pan'))
-
-        tilt_process = Process(target=pid_process,
-                               args=(tilt, tilt_p, tilt_i, tilt_d, center_y, CENTER[1], 'tilt'))
-
-        servo_process = Process(target=set_servos, args=(pan, tilt))
-
-        detect_processr.start()
-        pan_process.start()
-        tilt_process.start()
-        servo_process.start()
-
-        detect_processr.join()
-        pan_process.join()
-        tilt_process.join()
-        servo_process.join()
-
-
-if __name__ == '__main__':
-    pantilt_process_manager()
+        try:
+            # Join all 4 processes
+            processObjectCenter.join()
+            #processPanning.join()
+            processTilting.join()
+            processSetServos.join()
+        except KeyboardInterrupt:
+            # Handle keyboard interrupt to exit gracefully
+            print("Program stopped")
+        finally:
+            # Disable the servos
+            # pan_servo.close()
+            tilt_servo.ChangeDutyCycle(0)
+            pan_servo.ChangeDutyCycle(0)
+            tilt_servo.stop()
+            pan_servo.stop()
+            GPIO.cleanup()
