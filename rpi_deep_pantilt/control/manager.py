@@ -1,13 +1,22 @@
 import logging
 from multiprocessing import Value, Process, Manager
+from threading import Thread
 import time
+from imutils.video import VideoStream
 
-import pantilthat as pth
+import RPi.GPIO as GPIO
 import signal
 import sys
 import numpy as np
 
-from rpi_deep_pantilt.detect.camera import PiCameraStream
+#relic imports(artefacts)
+import cv2
+import argparse
+import os
+import importlib.util
+
+#replace basic functionality with imutils videostream
+#from rpi_deep_pantilt.detect.camera import PiCameraStream 
 from rpi_deep_pantilt.detect.ssd_mobilenet_v3_coco import SSDMobileNet_V3_Small_Coco_PostProcessed, SSDMobileNet_V3_Coco_EdgeTPU_Quant
 from rpi_deep_pantilt.control.pid import PIDController
 
@@ -24,6 +33,23 @@ CENTER = (
     RESOLUTION[1] // 2
 )
 
+GPIO.setmode(GPIO.BCM)
+#change pwm pins to 13 hardware pwm and other but 12=pwm0, 13=pwm1, same channel
+#18 =pcm_clk, 19=pcm_fs
+tilt_pin=13
+#tilt_pin = 3
+pan_pin = 5
+#add config file to set pins from
+
+GPIO.setup(tilt_pin, GPIO.OUT)
+GPIO.setup(pan_pin, GPIO.OUT)
+# Create AngularServo instances for pan and tilt
+pan_servo = GPIO.PWM(pan_pin, 50) # Replace 17 with the actual GPIO pin for pan
+tilt_servo = GPIO.PWM(tilt_pin, 50)
+
+# Define the range for the motors
+servoRange = (-90, 90)
+
 # function to handle keyboard interrupt
 
 
@@ -32,8 +58,11 @@ def signal_handler(sig, frame):
     print("[INFO] You pressed `ctrl + c`! Exiting...")
 
     # disable the servos
-    pth.servo_enable(1, False)
-    pth.servo_enable(2, False)
+    tilt_servo.ChangeDutyCycle(0)
+    pan_servo.ChangeDutyCycle(0)
+    tilt_servo.stop()
+    pan_servo.stop()
+    GPIO.cleanup()
 
     # exit
     sys.exit()
@@ -45,16 +74,19 @@ def run_detect(center_x, center_y, labels, edge_tpu):
     else:
         model = SSDMobileNet_V3_Small_Coco_PostProcessed()
 
-    capture_manager = PiCameraStream(resolution=RESOLUTION)
-    capture_manager.start()
-    capture_manager.start_overlay()
+    #capture_manager = PiCameraStream(resolution=RESOLUTION)
+    #capture_manager.start()
+    #capture_manager.start_overlay()
+    vs = VideoStream(usePiCamera=False).start()
+
+    #how to do the overlays now, with cv2 instead
 
     label_idxs = model.label_to_category_index(labels)
     start_time = time.time()
     fps_counter = 0
-    while not capture_manager.stopped:
-        if capture_manager.frame is not None:
-            frame = capture_manager.read()
+    while True:
+            frame = vs.read()
+            frame = cv2.flip(frame, 1)
             prediction = model.predict(frame)
 
             if not len(prediction.get('detection_boxes')):
@@ -83,8 +115,8 @@ def run_detect(center_x, center_y, labels, edge_tpu):
                 logging.info(
                     f'Tracking {display_name} center_x {x} center_y {y}')
 
-            overlay = model.create_overlay(frame, prediction)
-            capture_manager.overlay_buff = overlay
+            #overlay = model.create_overlay(frame, prediction)
+            #capture_manager.overlay_buff = overlay
             if LOGLEVEL is logging.DEBUG and (time.time() - start_time) > 1:
                 fps_counter += 1
                 fps = fps_counter / (time.time() - start_time)
@@ -97,23 +129,34 @@ def in_range(val, start, end):
     # determine the input vale is in the supplied range
     return (val >= start and val <= end)
 
+def set_servo(servo, angle):
+    #assert angle > 30 and angle <= 150
+    #tilt_servo = GPIO.PWM(tilt_pin, 50)
+    #tilt_servo.start(8)
+    dutyCycle = angle / 18. + 3.
+    servo.ChangeDutyCycle(dutyCycle)
+    time.sleep(0.3)
+    servo.stop()
 
-def set_servos(pan, tilt):
-    # signal trap to handle keyboard interrupt
+def set_servos(tlt, pan):
+    # Signal trap to handle keyboard interrupt
     signal.signal(signal.SIGINT, signal_handler)
-
+    
+    # Loop indefinitely
     while True:
-        pan_angle = -1 * pan.value
-        tilt_angle = tilt.value
-
-        # if the pan angle is within the range, pan
-        if in_range(pan_angle, SERVO_MIN, SERVO_MAX):
-            pth.pan(pan_angle)
+        # The pan and tilt angles are reversed
+        #panAngle = -1 * pan.value
+        pan_angle = pan.value
+        #tiltAngle = -1 * tlt.value
+        tilt_angle = tlt.value #removed -1 because vertical flipping is off
+        # If the pan angle is within the range, pan
+        if in_range(pan_angle, servoRange[0], servoRange[1]):
+            set_servo(pan_servo, pan_angle)
         else:
             logging.info(f'pan_angle not in range {pan_angle}')
-
-        if in_range(tilt_angle, SERVO_MIN, SERVO_MAX):
-            pth.tilt(tilt_angle)
+        # If the tilt angle is within the range, tilt
+        if in_range(tilt_angle, servoRange[0], servoRange[1]):
+            set_servo(tilt_servo, tilt_angle)
         else:
             logging.info(f'tilt_angle not in range {tilt_angle}')
 
@@ -141,8 +184,8 @@ def pantilt_process_manager(
     labels=('person',)
 ):
 
-    pth.servo_enable(1, True)
-    pth.servo_enable(2, True)
+    tilt_servo.start(8) #check effects
+    pan_servo.start(8)
     with Manager() as manager:
         # set initial bounding box (x, y)-coordinates to center of frame
         center_x = manager.Value('i', 0)
